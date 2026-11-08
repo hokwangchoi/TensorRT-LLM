@@ -108,6 +108,10 @@ GB = 1 << 30
 # allocated after the pools, outside the GPU cache quota.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
+# Warn when more than this share of the attention-matched prefix is recomputed
+# for lack of a snapshot, once enough prefix has been matched to judge.
+_SNAPSHOT_LOSS_WARN_SHARE = 0.1
+_SNAPSHOT_LOSS_MIN_MATCHED_TOKENS = 1 << 20
 
 
 class InforwardSnapshotEntry(NamedTuple):
@@ -254,6 +258,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._branch_snapshot_points: Dict[int, int] = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
+        self._snapshot_matched_tokens_total = 0
+        # Since the last get_iteration_stats()
+        self._iter_snapshot_pruned_tokens = 0
+        self._iter_snapshot_matched_tokens = 0
+        self._snapshot_loss_warned = False
         self._branch_snapshots_taken_total = 0
         self._branch_snapshots_skipped_total: Dict[str, int] = {}
         num_cuda_graph_padding_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
@@ -1696,11 +1705,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
         """Snapshot where this request leaves the reuse tree, for its siblings."""
-        if not self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
-            return
         # Generation-only requests receive their prompt state from the context
         # worker and never prefill here, so they cannot take a snapshot.
         if req.is_dummy_request or req.is_disagg_generation_init_state:
+            return
+        if num_lookup_tokens is not None:
+            self._record_prefix_loss(kv_cache)
+        if not self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
             return
         if num_lookup_tokens is None:
             self._skip_branch_snapshot("no_fresh_match")
@@ -1717,13 +1728,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
         divergence = diagnostics._get_num_reusable_tokens_before_pruning()
         reused = kv_cache.num_committed_tokens
-        if self.local_num_mamba_layers > 0:
-            hybrid_depth = diagnostics._get_num_reusable_tokens_before_hybrid_pruning()
-            # Loss attributable to a missing recurrent snapshot, versus loss
-            # attributable to attention pages having been evicted. These call
-            # for different fixes, so they are counted apart.
-            self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
-            self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
 
         # The whole lookup range matched, so there is no fork here.
         if divergence >= num_lookup_tokens:
@@ -1748,6 +1752,46 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._branch_snapshot_points[req.py_request_id] = point
         self._apply_branch_snapshot_point(req, context_current_position=reused)
+
+    def _record_prefix_loss(self, kv_cache: _KVCache) -> None:
+        """Count the matched prefix lost to a missing snapshot or to evicted pages.
+
+        These call for different fixes, so they are counted apart. A snapshot
+        hit rate does not show the first: a lookup that falls back to an older
+        snapshot of the same prefix still counts as a hit.
+        """
+        if self.local_num_mamba_layers == 0 or self.is_estimating_kv_cache:
+            return
+        diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
+        divergence = diagnostics._get_num_reusable_tokens_before_pruning()
+        hybrid_depth = diagnostics._get_num_reusable_tokens_before_hybrid_pruning()
+        snapshot_pruned = max(0, hybrid_depth - kv_cache.num_committed_tokens)
+        self._snapshot_pruned_tokens_total += snapshot_pruned
+        self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
+        self._snapshot_matched_tokens_total += hybrid_depth
+        self._iter_snapshot_pruned_tokens += snapshot_pruned
+        self._iter_snapshot_matched_tokens += hybrid_depth
+
+    def _warn_on_snapshot_loss(self) -> None:
+        """Warn once when evicted snapshots cost a large share of prefix reuse."""
+        matched = self._snapshot_matched_tokens_total
+        if (
+            self._snapshot_loss_warned
+            or self.mapping.rank != 0
+            or matched < _SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
+        ):
+            return
+        share = self._snapshot_pruned_tokens_total / matched
+        if share <= _SNAPSHOT_LOSS_WARN_SHARE:
+            return
+        self._snapshot_loss_warned = True
+        logger.warning(
+            f"[MambaHybridCacheManagerV2] {share:.0%} of the prefix tokens matched in the "
+            "attention cache were recomputed because no recurrent-state snapshot covered "
+            "them: the recurrent-state pool is too small for this workload's prefix reuse. "
+            "Give it a larger share of the cache with 'kv_cache_config.pool_ratio' or a "
+            "smaller 'kv_cache_config.avg_seq_len'."
+        )
 
     def _apply_branch_snapshot_point(
         self,
@@ -1795,6 +1839,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         report = super().get_iteration_stats()
         if report is None:
             return None
+        if self.local_num_mamba_layers > 0:
+            report.snapshot_matched_tokens = self._iter_snapshot_matched_tokens
+            report.snapshot_pruned_tokens = self._iter_snapshot_pruned_tokens
+            self._iter_snapshot_matched_tokens = 0
+            self._iter_snapshot_pruned_tokens = 0
+            self._warn_on_snapshot_loss()
 
         pool_group_ids = sorted(
             {
