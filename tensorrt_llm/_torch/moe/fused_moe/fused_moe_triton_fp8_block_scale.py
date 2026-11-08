@@ -11,9 +11,13 @@ import triton.language as tl
 _BLOCK_SHAPE = [128, 128]  # [group_k, group_n] for FP8 block-scale
 _BLOCK_SIZE_M = 16
 # Used when experts average at least _LARGE_M_MIN_ROWS rows, so that each
-# weight tile is loaded once per 64 rows instead of once per 16.
+# weight tile is loaded once per 64 rows instead of once per 16. These calls
+# also quantize activations to FP8 per 1x128 group, as the other FP8
+# block-scale MoE backends do; smaller calls keep BF16 activations, where the
+# quantization costs more than the FP8 MMA saves.
 _BLOCK_SIZE_M_LARGE = 64
 _LARGE_M_MIN_ROWS = 32
+_FP8_E4M3_MAX = 448.0
 
 
 def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
@@ -21,6 +25,57 @@ def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
     if num_tokens * top_k >= _LARGE_M_MIN_ROWS * num_experts:
         return _BLOCK_SIZE_M_LARGE
     return _BLOCK_SIZE_M
+
+
+@triton.jit
+def _fp8_quant_1x128_kernel(
+    x_ptr,
+    q_ptr,
+    s_ptr,
+    M,
+    K,
+    stride_xm,
+    stride_qm,
+    stride_sm,
+    GROUP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """Quantize each 1xGROUP_K group of BF16 rows to FP8 E4M3 with an F32 scale."""
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * GROUP_K + tl.arange(0, GROUP_K)
+    mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+    x = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :], mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-10) / FP8_MAX
+    q = (x / scale[:, None]).to(tl.float8e4nv)
+    tl.store(q_ptr + offs_m[:, None] * stride_qm + offs_k[None, :], q, mask=mask)
+    tl.store(s_ptr + offs_m * stride_sm + pid_k, scale, mask=offs_m < M)
+
+
+def _fp8_quant_1x128(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (x_fp8 (M, K), scales (M, ceil(K / 128)) F32) for a contiguous BF16 x."""
+    M, K = x.shape
+    group_k = _BLOCK_SHAPE[0]
+    q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty((M, triton.cdiv(K, group_k)), dtype=torch.float32, device=x.device)
+    block_m = 32
+    _fp8_quant_1x128_kernel[(triton.cdiv(M, block_m), s.shape[1])](
+        x,
+        q,
+        s,
+        M,
+        K,
+        x.stride(0),
+        q.stride(0),
+        s.stride(0),
+        GROUP_K=group_k,
+        BLOCK_M=block_m,
+        FP8_MAX=_FP8_E4M3_MAX,
+    )
+    return q, s
 
 
 @triton.jit
@@ -237,6 +292,7 @@ def _fused_moe_bf16act_fp8w_kernel(
     b_ptr,
     c_ptr,
     b_scale_ptr,
+    a_scale_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -255,6 +311,7 @@ def _fused_moe_bf16act_fp8w_kernel(
     stride_bse,
     stride_bsk,
     stride_bsn,
+    stride_asm,
     group_n: tl.constexpr,
     group_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -266,14 +323,16 @@ def _fused_moe_bf16act_fp8w_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     FUSE_TOPK_REDUCE: tl.constexpr,
     REDUCE_TOPK: tl.constexpr,
+    FP8_ACT: tl.constexpr,
 ):
     """
-    Fused MoE GEMM with BF16 activations and FP8 block-scaled weights.
+    Fused MoE GEMM with FP8 block-scaled weights and BF16 or FP8 activations.
 
-    For weight-only quantized models: activations never go through FP8, so
-    there is no per-layer quantization error. Each FP8 weight tile is
-    dequanted to BF16 inside the K-loop using the per-block scale:
+    With BF16 activations, each FP8 weight tile is dequanted to BF16 inside the
+    K-loop using the per-block scale, so activations carry no quantization error:
         C[m, n] += dot(A_bf16[m, :], B_fp8[:, n].to(bf16)) * B_scale[n//gn, k//gk]
+    With FP8_ACT, A is FP8 with one F32 scale per 1x128 group (`_fp8_quant_1x128`):
+        C[m, n] += dot(A_fp8[m, :], B_fp8[:, n]) * A_scale[m, k//gk] * B_scale[n//gn, k//gk]
     """
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -322,6 +381,7 @@ def _fused_moe_bf16act_fp8w_kernel(
 
     offs_bsn = offs_bn // group_n
     b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+    a_scale_ptrs = a_scale_ptr + offs_token // top_k * stride_asm
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -331,13 +391,19 @@ def _fused_moe_bf16act_fp8w_kernel(
             other=0.0,
         )
         b_fp8 = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = b_fp8.to(tl.bfloat16)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
         b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
-        accumulator += tl.dot(a, b, out_dtype=tl.float32) * b_scale[None, :]
+        if FP8_ACT:
+            a_scale = tl.load(a_scale_ptrs + offs_ks, mask=token_mask, other=0.0)
+            accumulator += (
+                tl.dot(a, b_fp8, out_dtype=tl.float32) * a_scale[:, None] * b_scale[None, :]
+            )
+        else:
+            b = b_fp8.to(tl.bfloat16)
+            accumulator += tl.dot(a, b, out_dtype=tl.float32) * b_scale[None, :]
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -374,15 +440,17 @@ def _invoke_bf16act_fp8w_moe_kernel(
     fuse_topk_reduce: bool = False,
     reduce_topk: int = 1,
     block_size_m: int = _BLOCK_SIZE_M,
+    A_scale: torch.Tensor | None = None,
 ) -> None:
     """
     Launch _fused_moe_bf16act_fp8w_kernel.
 
     Tensor layouts (default, fuse_topk_reduce=False):
-        A       : (num_tokens_or_expanded, K)  BF16, contiguous
+        A       : (num_tokens_or_expanded, K)  BF16, or FP8 with A_scale, contiguous
         B       : (E, N, K)                    FP8, contiguous
         C       : (batch, top_k_orig, N)       BF16, stride(1)=N, stride(2)=1
         B_scale : (E, N//128, K//128)           F32
+        A_scale : (num_tokens_or_expanded, K//128) F32, or None for BF16 A
         topk_weights: (num_tokens, top_k_orig) F32  (flat-indexable by offs_token)
 
     When fuse_topk_reduce=True (used for the second MoE GEMM), each program
@@ -410,6 +478,7 @@ def _invoke_bf16act_fp8w_moe_kernel(
         B,
         C,
         B_scale,
+        A_scale if A_scale is not None else B_scale,
         topk_weights,
         sorted_token_ids,
         expert_ids,
@@ -428,6 +497,7 @@ def _invoke_bf16act_fp8w_moe_kernel(
         B_scale.stride(0) if B_scale.ndim >= 2 else 0,
         B_scale.stride(2) if B_scale.ndim == 3 else 0,
         B_scale.stride(1) if B_scale.ndim >= 2 else 0,
+        A_scale.stride(0) if A_scale is not None else 0,
         group_n=group_n,
         group_k=group_k,
         top_k=top_k,
@@ -436,6 +506,7 @@ def _invoke_bf16act_fp8w_moe_kernel(
         FUSE_TOPK_REDUCE=fuse_topk_reduce,
         REDUCE_TOPK=reduce_topk,
         BLOCK_SIZE_M=block_size_m,
+        FP8_ACT=A_scale is not None,
     )
 
 
@@ -578,9 +649,15 @@ def run_triton_fp8_block_scale_moe(
         token_selected_experts, block_size_m, num_experts
     )
 
+    fp8_act = block_size_m == _BLOCK_SIZE_M_LARGE
+    x = x.contiguous()
+    x_scale = None
+    if fp8_act:
+        x, x_scale = _fp8_quant_1x128(x)
+
     ic1 = torch.empty((num_tokens, top_k, gate_up_size), dtype=torch.bfloat16, device=device)
     _invoke_bf16act_fp8w_moe_kernel(
-        x.contiguous(),
+        x,
         w3_w1,
         ic1,
         w3_w1_scales,
@@ -591,6 +668,7 @@ def run_triton_fp8_block_scale_moe(
         mul_routed_weight=False,
         top_k=top_k,
         block_size_m=block_size_m,
+        A_scale=x_scale,
     )
 
     if act_int in (swiglu, silu):
@@ -623,6 +701,9 @@ def run_triton_fp8_block_scale_moe(
         # The unfused path uses the 3D C layout expected by the GEMM wrapper.
         gemm2_out = torch.empty((num_tokens, 1, hidden), dtype=torch.bfloat16, device=device)
 
+    ic2_scale = None
+    if fp8_act:
+        ic2, ic2_scale = _fp8_quant_1x128(ic2)
     _invoke_bf16act_fp8w_moe_kernel(
         ic2,
         w2,
@@ -637,6 +718,7 @@ def run_triton_fp8_block_scale_moe(
         fuse_topk_reduce=fuse_topk_reduce,
         reduce_topk=top_k,
         block_size_m=block_size_m,
+        A_scale=ic2_scale,
     )
 
     if not fuse_topk_reduce:
